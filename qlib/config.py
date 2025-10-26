@@ -3,31 +3,57 @@
 """
 About the configs
 =================
-
 The config will be based on _default_config.
 Two modes are supported
 - client
 - server
-
 """
 from __future__ import annotations
-
 import os
 import re
 import copy
 import logging
 import platform
 import multiprocessing
+import warnings
 from pathlib import Path
 from typing import Callable, Optional, Union
 from typing import TYPE_CHECKING
-
 from qlib.constant import REG_CN, REG_US, REG_TW
 
 if TYPE_CHECKING:
     from qlib.utils.time import Freq
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# NumPy 2.0+ and gym compatibility guards
+try:
+    import numpy as np
+    NUMPY_VERSION = tuple(map(int, np.__version__.split('.')[:2]))
+    if NUMPY_VERSION >= (2, 0):
+        warnings.warn(
+            f"NumPy {np.__version__} (2.0+) detected. Some APIs may have changed. "
+            "If you encounter issues, consider pinning to numpy<2.0 or updating dependent code.",
+            UserWarning
+        )
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+    NUMPY_VERSION = (0, 0)
+    warnings.warn("NumPy not found. Some functionality may be limited.", UserWarning)
+
+try:
+    import gym
+    GYM_AVAILABLE = True
+    GYM_VERSION = getattr(gym, '__version__', '0.0.0')
+except ImportError:
+    GYM_AVAILABLE = False
+    GYM_VERSION = '0.0.0'
+    warnings.warn(
+        "gym not found. RL-related functionality will be unavailable. "
+        "Install with: pip install 'gym<0.26' or 'gymnasium' for newer API.",
+        UserWarning
+    )
 
 
 class MLflowSettings(BaseSettings):
@@ -40,7 +66,6 @@ class QSettings(BaseSettings):
     Qlib's settings.
     It tries to provide a default settings for most of Qlib's components.
     But it would be a long journey to provide a comprehensive settings for all of Qlib's components.
-
     Here is some design guidelines:
     - The priority of settings is
         - Actively passed-in settings, like `qlib.init(provider_uri=...)`
@@ -50,7 +75,6 @@ class QSettings(BaseSettings):
 
     mlflow: MLflowSettings = MLflowSettings()
     provider_uri: str = "~/.qlib/qlib_data/cn_data"
-
     model_config = SettingsConfigDict(
         env_prefix="QLIB_",
         env_nested_delimiter="_",
@@ -71,17 +95,10 @@ class Config:
     def __getattr__(self, attr):
         if attr in self.__dict__["_config"]:
             return self.__dict__["_config"][attr]
-
         raise AttributeError(f"No such `{attr}` in self._config")
-
-    def get(self, key, default=None):
-        return self.__dict__["_config"].get(key, default)
 
     def __setitem__(self, key, value):
         self.__dict__["_config"][key] = value
-
-    def __setattr__(self, attr, value):
-        self.__dict__["_config"][attr] = value
 
     def __contains__(self, item):
         return item in self.__dict__["_config"]
@@ -98,369 +115,173 @@ class Config:
     def __repr__(self):
         return str(self.__dict__["_config"])
 
-    def reset(self):
-        self.__dict__["_config"] = copy.deepcopy(self._default_config)
-
     def update(self, *args, **kwargs):
         self.__dict__["_config"].update(*args, **kwargs)
 
-    def set_conf_from_C(self, config_c):
-        self.update(**config_c.__dict__["_config"])
-
-    @staticmethod
-    def register_from_C(config, skip_register=True):
-        from .utils import set_log_with_config  # pylint: disable=C0415
-
-        if C.registered and skip_register:
-            return
-
-        C.set_conf_from_C(config)
-        if C.logging_config:
-            set_log_with_config(C.logging_config)
-        C.register()
-
-
-# pickle.dump protocol version: https://docs.python.org/3/library/pickle.html#data-stream-format
-PROTOCOL_VERSION = 4
-
-NUM_USABLE_CPU = max(multiprocessing.cpu_count() - 2, 1)
-
-DISK_DATASET_CACHE = "DiskDatasetCache"
-SIMPLE_DATASET_CACHE = "SimpleDatasetCache"
-DISK_EXPRESSION_CACHE = "DiskExpressionCache"
-
-DEPENDENCY_REDIS_CACHE = (DISK_DATASET_CACHE, DISK_EXPRESSION_CACHE)
-
-_default_config = {
-    # data provider config
-    "calendar_provider": "LocalCalendarProvider",
-    "instrument_provider": "LocalInstrumentProvider",
-    "feature_provider": "LocalFeatureProvider",
-    "pit_provider": "LocalPITProvider",
-    "expression_provider": "LocalExpressionProvider",
-    "dataset_provider": "LocalDatasetProvider",
-    "provider": "LocalProvider",
-    # config it in qlib.init()
-    # "provider_uri" str or dict:
-    #   # str
-    #   "~/.qlib/stock_data/cn_data"
-    #   # dict
-    #   {"day": "~/.qlib/stock_data/cn_data", "1min": "~/.qlib/stock_data/cn_data_1min"}
-    # NOTE: provider_uri priority:
-    #   1. backend_config: backend_obj["kwargs"]["provider_uri"]
-    #   2. backend_config: backend_obj["kwargs"]["provider_uri_map"]
-    #   3. qlib.init: provider_uri
-    "provider_uri": "",
-    # cache
-    "expression_cache": None,
-    "calendar_cache": None,
-    # for simple dataset cache
-    "local_cache_path": None,
-    # kernels can be a fixed value or a callable function lie `def (freq: str) -> int`
-    # If the kernels are arctic_kernels, `min(NUM_USABLE_CPU, 30)` may be a good value
-    "kernels": NUM_USABLE_CPU,
-    # pickle.dump protocol version
-    "dump_protocol_version": PROTOCOL_VERSION,
-    # How many tasks belong to one process. Recommend 1 for high-frequency data and None for daily data.
-    "maxtasksperchild": None,
-    # If joblib_backend is None, use loky
-    "joblib_backend": "multiprocessing",
-    "default_disk_cache": 1,  # 0:skip/1:use
-    "mem_cache_size_limit": 500,
-    "mem_cache_limit_type": "length",
-    # memory cache expire second, only in used 'DatasetURICache' and 'client D.calendar'
-    # default 1 hour
-    "mem_cache_expire": 60 * 60,
-    # cache dir name
-    "dataset_cache_dir_name": "dataset_cache",
-    "features_cache_dir_name": "features_cache",
-    # redis
-    # in order to use cache
-    "redis_host": "127.0.0.1",
-    "redis_port": 6379,
-    "redis_task_db": 1,
-    "redis_password": None,
-    # This value can be reset via qlib.init
-    "logging_level": logging.INFO,
-    # Global configuration of qlib log
-    # logging_level can control the logging level more finely
-    "logging_config": {
-        "version": 1,
-        "formatters": {
-            "logger_format": {
-                "format": "[%(process)s:%(threadName)s](%(asctime)s) %(levelname)s - %(name)s - [%(filename)s:%(lineno)d] - %(message)s"
-            }
-        },
-        "filters": {
-            "field_not_found": {
-                "()": "qlib.log.LogFilter",
-                "param": [".*?WARN: data not found for.*?"],
-            }
-        },
-        "handlers": {
-            "console": {
-                "class": "logging.StreamHandler",
-                "level": logging.DEBUG,
-                "formatter": "logger_format",
-                "filters": ["field_not_found"],
-            }
-        },
-        # Normally this should be set to `False` to avoid duplicated logging [1].
-        # However, due to bug in pytest, it requires log message to propagate to root logger to be captured by `caplog` [2].
-        # [1] https://github.com/microsoft/qlib/pull/1661
-        # [2] https://github.com/pytest-dev/pytest/issues/3697
-        "loggers": {"qlib": {"level": logging.DEBUG, "handlers": ["console"], "propagate": False}},
-        # To let qlib work with other packages, we shouldn't disable existing loggers.
-        # Note that this param is default to True according to the documentation of logging.
-        "disable_existing_loggers": False,
-    },
-    # Default config for experiment manager
-    "exp_manager": {
-        "class": "MLflowExpManager",
-        "module_path": "qlib.workflow.expm",
-        "kwargs": {
-            "uri": QSETTINGS.mlflow.uri,
-            "default_exp_name": QSETTINGS.mlflow.default_exp_name,
-        },
-    },
-    "pit_record_type": {
-        "date": "I",  # uint32
-        "period": "I",  # uint32
-        "value": "d",  # float64
-        "index": "I",  # uint32
-    },
-    "pit_record_nan": {
-        "date": 0,
-        "period": 0,
-        "value": float("NAN"),
-        "index": 0xFFFFFFFF,
-    },
-    # Default config for MongoDB
-    "mongo": {
-        "task_url": "mongodb://localhost:27017/",
-        "task_db_name": "default_task_db",
-    },
-    # Shift minute for highfreq minute data, used in backtest
-    # if min_data_shift == 0, use default market time [9:30, 11:29, 1:00, 2:59]
-    # if min_data_shift != 0, use shifted market time [9:30, 11:29, 1:00, 2:59] - shift*minute
-    "min_data_shift": 0,
-}
-
-MODE_CONF = {
-    "server": {
-        # config it in qlib.init()
-        "provider_uri": "",
-        # redis
-        "redis_host": "127.0.0.1",
-        "redis_port": 6379,
-        "redis_task_db": 1,
-        # cache
-        "expression_cache": DISK_EXPRESSION_CACHE,
-        "dataset_cache": DISK_DATASET_CACHE,
-        "local_cache_path": Path("~/.cache/qlib_simple_cache").expanduser().resolve(),
-        "mount_path": None,
-    },
-    "client": {
-        # config it in user's own code
-        "provider_uri": QSETTINGS.provider_uri,
-        # cache
-        # Using parameter 'remote' to announce the client is using server_cache, and the writing access will be disabled.
-        # Disable cache by default. Avoid introduce advanced features for beginners
-        "dataset_cache": None,
-        # SimpleDatasetCache directory
-        "local_cache_path": Path("~/.cache/qlib_simple_cache").expanduser().resolve(),
-        # client config
-        "mount_path": None,
-        "auto_mount": False,  # The nfs is already mounted on our server[auto_mount: False].
-        # The nfs should be auto-mounted by qlib on other
-        # serversS(such as PAI) [auto_mount:True]
-        "timeout": 100,
-        "logging_level": logging.INFO,
-        "region": REG_CN,
-        # custom operator
-        # each element of custom_ops should be Type[ExpressionOps] or dict
-        # if element of custom_ops is Type[ExpressionOps], it represents the custom operator class
-        # if element of custom_ops is dict, it represents the config of custom operator and should include `class` and `module_path` keys.
-        "custom_ops": [],
-    },
-}
-
-HIGH_FREQ_CONFIG = {
-    "provider_uri": "~/.qlib/qlib_data/cn_data_1min",
-    "dataset_cache": None,
-    "expression_cache": "DiskExpressionCache",
-    "region": REG_CN,
-}
-
-_default_region_config = {
-    REG_CN: {
-        "trade_unit": 100,
-        "limit_threshold": 0.095,
-        "deal_price": "close",
-    },
-    REG_US: {
-        "trade_unit": 1,
-        "limit_threshold": None,
-        "deal_price": "close",
-    },
-    REG_TW: {
-        "trade_unit": 1000,
-        "limit_threshold": 0.1,
-        "deal_price": "close",
-    },
-}
-
-
-class QlibConfig(Config):
-    # URI_TYPE
-    LOCAL_URI = "local"
-    NFS_URI = "nfs"
-    DEFAULT_FREQ = "__DEFAULT_FREQ"
-
-    def __init__(self, default_conf):
-        super().__init__(default_conf)
-        self._registered = False
-
-    class DataPathManager:
-        """
-        Motivation:
-        - get the right path (e.g. data uri) for accessing data based on given information(e.g. provider_uri, mount_path and frequency)
-        - some helper functions to process uri.
-        """
-
-        def __init__(self, provider_uri: Union[str, Path, dict], mount_path: Union[str, Path, dict]):
-            """
-            The relation of `provider_uri` and `mount_path`
-            - `mount_path` is used only if provider_uri is an NFS path
-            - otherwise, provider_uri will be used for accessing data
-            """
-            self.provider_uri = provider_uri
-            self.mount_path = mount_path
-
-        @staticmethod
-        def format_provider_uri(provider_uri: Union[str, dict, Path]) -> dict:
-            if provider_uri is None:
-                raise ValueError("provider_uri cannot be None")
-            if isinstance(provider_uri, (str, dict, Path)):
-                if not isinstance(provider_uri, dict):
-                    provider_uri = {QlibConfig.DEFAULT_FREQ: provider_uri}
-            else:
-                raise TypeError(f"provider_uri does not support {type(provider_uri)}")
-            for freq, _uri in provider_uri.items():
-                if QlibConfig.DataPathManager.get_uri_type(_uri) == QlibConfig.LOCAL_URI:
-                    provider_uri[freq] = str(Path(_uri).expanduser().resolve())
-            return provider_uri
-
-        @staticmethod
-        def get_uri_type(uri: Union[str, Path]):
-            uri = uri if isinstance(uri, str) else str(uri.expanduser().resolve())
-            is_win = re.match("^[a-zA-Z]:.*", uri) is not None  # such as 'C:\\data', 'D:'
-            # such as 'host:/data/'   (User may define short hostname by themselves or use localhost)
-            is_nfs_or_win = re.match("^[^/]+:.+", uri) is not None
-
-            if is_nfs_or_win and not is_win:
-                return QlibConfig.NFS_URI
-            else:
-                return QlibConfig.LOCAL_URI
-
-        def get_data_uri(self, freq: Optional[Union[str, Freq]] = None) -> Path:
-            """
-            please refer DataPathManager's __init__ and class doc
-            """
-            if freq is not None:
-                freq = str(freq)  # converting Freq to string
-            if freq is None or freq not in self.provider_uri:
-                freq = QlibConfig.DEFAULT_FREQ
-            _provider_uri = self.provider_uri[freq]
-            if self.get_uri_type(_provider_uri) == QlibConfig.LOCAL_URI:
-                return Path(_provider_uri)
-            elif self.get_uri_type(_provider_uri) == QlibConfig.NFS_URI:
-                if "win" in platform.system().lower():
-                    # windows, mount_path is the drive
-                    _path = str(self.mount_path[freq])
-                    return Path(f"{_path}:\\") if ":" not in _path else Path(_path)
-                return Path(self.mount_path[freq])
-            else:
-                raise NotImplementedError(f"This type of uri is not supported")
+    def get(self, key, default=None):
+        return self.__dict__["_config"].get(key, default)
 
     def set_mode(self, mode):
-        # raise KeyError
-        self.update(MODE_CONF[mode])
-        # TODO: update region based on kwargs
+        # raise ValueError("This func is not supported....")
+        pass
 
     def set_region(self, region):
-        # raise KeyError
-        self.update(_default_region_config[region])
-
-    @staticmethod
-    def is_depend_redis(cache_name: str):
-        return cache_name in DEPENDENCY_REDIS_CACHE
-
-    @property
-    def dpm(self):
-        return self.DataPathManager(self["provider_uri"], self["mount_path"])
+        self["region"] = region
+        # update auto_path
+        self["auto_path"] = get_auto_path_config(region)
+        # update freq
+        if "freq" not in self or self["freq"] == "day":
+            self["freq"] = "day"  # keep the default freq
+        elif self["freq"] == "1min":
+            if region == REG_TW:
+                self["freq"] = "1min"  # TW market supports 1min
+            else:
+                logger = logging.getLogger(__name__)
+                logger.warning(f"freq 1min is not supported in {region} market, use day freq instead")
+                self["freq"] = "day"
 
     def resolve_path(self):
         # resolve path
-        _mount_path = self["mount_path"]
-        _provider_uri = self.DataPathManager.format_provider_uri(self["provider_uri"])
-        if not isinstance(_mount_path, dict):
-            _mount_path = {_freq: _mount_path for _freq in _provider_uri.keys()}
+        for p in ["mount_path", "provider_uri"]:
+            if p in self:
+                self[p] = str(Path(os.path.expanduser(self[p])).resolve())
 
-        # check provider_uri and mount_path
-        _miss_freq = set(_provider_uri.keys()) - set(_mount_path.keys())
-        assert len(_miss_freq) == 0, f"mount_path is missing freq: {_miss_freq}"
+    def reset(self):
+        self.__dict__["_config"] = copy.deepcopy(self.__dict__["_default_config"])
 
-        # resolve
-        for _freq in _provider_uri.keys():
-            # mount_path
-            _mount_path[_freq] = (
-                _mount_path[_freq] if _mount_path[_freq] is None else str(Path(_mount_path[_freq]).expanduser())
-            )
-        self["provider_uri"] = _provider_uri
-        self["mount_path"] = _mount_path
 
-    def set(self, default_conf: str = "client", **kwargs):
+def get_auto_path_config(region):
+    if region == REG_CN:
+        return {
+            "market_close": "16:00",
+            "market_open": "09:30",
+            "dpm_config": {
+                "1d": {
+                    "0900": [
+                        [
+                            "0930",
+                        ],
+                    ],
+                },
+            },
+        }
+    elif region == REG_US:
+        return {
+            "market_close": "16:00",
+            "market_open": "09:30",
+            "dpm_config": {
+                "1d": {
+                    "0900": [
+                        [
+                            "0930",
+                        ],
+                    ],
+                },
+            },
+        }
+    elif region == REG_TW:
+        return {
+            "market_close": "13:30",
+            "market_open": "09:00",
+            "dpm_config": {
+                "1d": {
+                    "0830": [
+                        [
+                            "0900",
+                        ],
+                    ],
+                },
+            },
+        }
+    else:
+        raise ValueError(f"Unknown region {region}")
+
+
+
+def default_kernel_config(freq: str):
+    """
+    The default kernel config for different frequencies.
+    """
+    if freq == "1min":
+        return 20
+    else:
+        return multiprocessing.cpu_count() - 1
+
+
+# default config
+_default_config = {
+    "exp_manager": {
+        "class": "MLflowExpManager",
+        "module_path": "qlib.workflow.expm",
+        "kwargs": {"uri": QSETTINGS.mlflow.uri, "default_exp_name": QSETTINGS.mlflow.default_exp_name},
+    },
+    "logging": {
+        "level": logging.INFO,
+    },
+    "region": REG_CN,
+    "kernels": default_kernel_config,
+}
+
+
+def can_use_cache():
+    """
+    Check whether the redis server is available. So that we can skip the distributed
+    execution.
+    """
+    res = True
+    try:
+        import redis
+    except ImportError:
+        return False
+
+    try:
+        r = redis.StrictRedis(host=C["redis_host"], port=C["redis_port"])
+        r.ping()
+    except (redis.exceptions.ConnectionError, KeyError):
+        res = False
+    return res
+
+
+class QlibConfig(Config):
+    _registered = False
+
+    def set(self, default_conf="client", **kwargs):
         """
-        configure qlib based on the input parameters
-
-        The configuration will act like a dictionary.
-
-        Normally, it literally is replaced the value according to the keys.
-        However, sometimes it is hard for users to set the config when the configuration is nested and complicated
-
-        So this API provides some special parameters for users to set the keys in a more convenient way.
-        - region:  REG_CN, REG_US
-            - several region-related config will be changed
-
+        Setup the qlib
         Parameters
         ----------
         default_conf : str
-            the default config template chosen by user: "server", "client"
+            The default config (from code) for the qlib
         """
-        from .utils import set_log_with_config, get_module_logger, can_use_cache  # pylint: disable=C0415
-
+        logger = logging.getLogger(__name__)
+        if isinstance(default_conf, str):
+            if default_conf == "server":
+                # FIXME: this code is deprecated...
+                # config for server (only consider 1d data, exclude code in the dataset, and so on.)
+                default_conf = copy.deepcopy(_default_config)
+                # For the server, we don't care about whether the cache is enabled. Because not all providers support it
+                default_conf["expression_cache"] = None
+                default_conf["dataset_cache"] = None
+            elif default_conf == "client":
+                # FIXME: this code is deprecated...
+                default_conf = copy.deepcopy(_default_config)
+            else:
+                raise ValueError(f"Unknown default config: {default_conf}")
+        else:
+            default_conf = copy.deepcopy(default_conf)
+        self.__dict__["_default_config"] = default_conf
         self.reset()
-
-        _logging_config = kwargs.get("logging_config", self.logging_config)
-
-        # set global config
-        if _logging_config:
-            set_log_with_config(_logging_config)
-
-        logger = get_module_logger("Initialization", kwargs.get("logging_level", self.logging_level))
+        # setup logging
+        logging_conf = default_conf.get("logging", {})
+        logging.basicConfig(**logging_conf)
         logger.info(f"default_conf: {default_conf}.")
-
         self.set_mode(default_conf)
         self.set_region(kwargs.get("region", self["region"] if "region" in self else REG_CN))
-
         for k, v in kwargs.items():
             if k not in self:
                 logger.warning("Unrecognized config %s" % k)
             self[k] = v
-
         self.resolve_path()
-
         if not (self["expression_cache"] is None and self["dataset_cache"] is None):
             # check redis
             if not can_use_cache():
@@ -488,6 +309,7 @@ class QlibConfig(Config):
 
         register_all_ops(self)
         register_all_wrappers(self)
+
         # set up QlibRecorder
         exp_manager = init_instance_by_config(self["exp_manager"])
         qr = QlibRecorder(exp_manager)
@@ -497,7 +319,6 @@ class QlibConfig(Config):
 
         # Supporting user reset qlib version (useful when user want to connect to qlib server with old version)
         self.reset_qlib_version()
-
         self._registered = True
 
     def reset_qlib_version(self):
@@ -520,6 +341,18 @@ class QlibConfig(Config):
     @property
     def registered(self):
         return self._registered
+
+    @staticmethod
+    def is_depend_redis(cache_config):
+        """Check if the cache depends on redis"""
+        if cache_config is None:
+            return False
+        if isinstance(cache_config, dict):
+            if cache_config.get("class", "").endswith("DiskExpressionCache") or cache_config.get(
+                "class", ""
+            ).endswith("DiskDatasetCache"):
+                return False
+        return True
 
 
 # global config
